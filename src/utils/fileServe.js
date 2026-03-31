@@ -2,37 +2,83 @@ const path = require('path');
 const fs = require('fs');
 
 /**
- * Resolves the actual file path from a stored file_url.
- * Handles both /uploads/... and relative paths.
+ * Resolves the actual absolute file path from a stored file_url.
  */
 const resolveFilePath = (fileUrl) => {
   if (!fileUrl) return null;
 
-  // Strip leading slash and /uploads/ prefix variations
+  // Strip all leading slashes and uploads/ prefix
   let relative = fileUrl
-    .replace(/^\/uploads\//, '')
+    .replace(/^\/+/, '')
     .replace(/^uploads\//, '');
 
-  const uploadDir = process.env.UPLOAD_DIR
-    ? path.resolve(process.env.UPLOAD_DIR)
-    : path.resolve(__dirname, '../../uploads');
+  // Determine upload directory
+  let uploadDir;
+  if (process.env.UPLOAD_DIR) {
+    uploadDir = path.resolve(process.env.UPLOAD_DIR);
+  } else {
+    uploadDir = path.resolve(process.cwd(), 'uploads');
+  }
 
-  return path.join(uploadDir, relative);
+  const resolved = path.join(uploadDir, relative);
+
+  // Debug log visible in Render logs
+  console.log('[fileServe] debug:', {
+    fileUrl,
+    relative,
+    uploadDir,
+    resolved,
+    cwd: process.cwd(),
+    exists: fs.existsSync(resolved),
+  });
+
+  return resolved;
+};
+
+/**
+ * List all files in uploads dir (for debugging).
+ */
+const listUploads = () => {
+  try {
+    const uploadDir = path.resolve(process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads'));
+    if (!fs.existsSync(uploadDir)) {
+      console.log('[fileServe] uploads dir missing:', uploadDir);
+      return;
+    }
+    const allFiles = [];
+    const walk = (dir) => {
+      fs.readdirSync(dir).forEach(f => {
+        const full = path.join(dir, f);
+        if (fs.statSync(full).isDirectory()) walk(full);
+        else allFiles.push(full.replace(uploadDir, ''));
+      });
+    };
+    walk(uploadDir);
+    console.log('[fileServe] files on disk:', allFiles.length ? allFiles : '(empty)');
+  } catch (e) {
+    console.log('[fileServe] listUploads error:', e.message);
+  }
 };
 
 /**
  * Serves a file for download or inline viewing.
- * @param {object} res - Express response
- * @param {string} fileUrl - stored file_url from DB
- * @param {string} fileName - original file name
- * @param {string} disposition - 'attachment' (download) or 'inline' (view in browser)
+ * disposition: 'attachment' (download) | 'inline' (view in browser)
  */
 const serveFile = (res, fileUrl, fileName, disposition = 'attachment') => {
+  if (!fileUrl) {
+    return res.status(404).json({
+      error: 'No file has been uploaded for this record yet.',
+    });
+  }
+
+  listUploads();
   const filePath = resolveFilePath(fileUrl);
 
   if (!filePath || !fs.existsSync(filePath)) {
     return res.status(404).json({
-      error: 'File not found on server. It may have been removed or not yet uploaded.',
+      error: 'File not found on server.',
+      looked_for: filePath,
+      hint: 'Render restarted and wiped the file (ephemeral storage), or the file path in the database is wrong. Please re-upload the file via the admin panel.',
     });
   }
 
@@ -56,11 +102,13 @@ const serveFile = (res, fileUrl, fileName, disposition = 'attachment') => {
   res.setHeader('Content-Type', contentType);
   res.setHeader('Content-Disposition', `${disposition}; filename="${safeFileName}"`);
   res.setHeader('Cache-Control', 'no-store');
-  // Hide backend internals
-  res.setHeader('X-Powered-By', 'UNAIDS Platform');
+  res.removeHeader('X-Powered-By');
 
   const stream = fs.createReadStream(filePath);
-  stream.on('error', () => res.status(500).json({ error: 'Error reading file' }));
+  stream.on('error', (err) => {
+    console.error('[fileServe] stream error:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Error reading file' });
+  });
   stream.pipe(res);
 };
 
