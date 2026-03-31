@@ -1,34 +1,40 @@
 const multer = require('multer');
-const path = require('path');
-const { v4: uuidv4 } = require('uuid');
-const fs = require('fs');
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const cloudinary = require('../config/cloudinary');
 
-const uploadDir = process.env.UPLOAD_DIR || './uploads';
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
+// Determine Cloudinary folder based on request path
+const getFolder = (req) => {
+  if (req.path.includes('countr') || req.baseUrl.includes('countr')) return 'unaids/profiles';
+  if (req.path.includes('roadmap') || req.baseUrl.includes('roadmap')) return 'unaids/roadmaps';
+  if (req.path.includes('news') || req.baseUrl.includes('news')) return 'unaids/news';
+  return 'unaids/documents';
+};
 
-const subDirs = ['documents', 'profiles', 'roadmaps', 'images', 'news'];
-subDirs.forEach(dir => {
-  const p = path.join(uploadDir, dir);
-  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+// Cloudinary storage for documents/PDFs
+const documentStorage = new CloudinaryStorage({
+  cloudinary,
+  params: async (req, file) => {
+    const folder = getFolder(req);
+    const isImage = file.mimetype.startsWith('image/');
+    return {
+      folder,
+      resource_type: isImage ? 'image' : 'raw',  // 'raw' for PDFs/docs
+      use_filename: true,
+      unique_filename: true,
+      // Keep original extension
+      format: undefined,
+    };
+  },
 });
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    let folder = 'documents';
-    if (req.path.includes('country') || req.path.includes('profile')) folder = 'profiles';
-    else if (req.path.includes('roadmap')) folder = 'roadmaps';
-    else if (req.path.includes('news')) folder = 'news';
-    else if (file.mimetype.startsWith('image/')) folder = 'images';
-    cb(null, path.join(uploadDir, folder));
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    const base = path.basename(file.originalname, ext)
-      .replace(/[^a-zA-Z0-9-_]/g, '_')
-      .substring(0, 50);
-    cb(null, `${base}-${uuidv4().substring(0, 8)}${ext}`);
+// Cloudinary storage for images (thumbnails, covers)
+const imageStorage = new CloudinaryStorage({
+  cloudinary,
+  params: {
+    folder: 'unaids/images',
+    resource_type: 'image',
+    allowed_formats: ['jpg', 'jpeg', 'png', 'webp', 'gif'],
+    transformation: [{ width: 1200, crop: 'limit', quality: 'auto' }],
   },
 });
 
@@ -47,7 +53,6 @@ const fileFilter = (req, file, cb) => {
     'image/gif',
     'image/svg+xml',
   ];
-
   if (allowedMimes.includes(file.mimetype)) {
     cb(null, true);
   } else {
@@ -55,12 +60,12 @@ const fileFilter = (req, file, cb) => {
   }
 };
 
+// Main upload instance — handles both docs and images
+// Uses documentStorage for everything; images get uploaded correctly via resource_type logic
 const upload = multer({
-  storage,
+  storage: documentStorage,
   fileFilter,
-  limits: {
-    fileSize: parseInt(process.env.MAX_FILE_SIZE) || 50 * 1024 * 1024, // 50MB
-  },
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
 });
 
 module.exports = upload;
