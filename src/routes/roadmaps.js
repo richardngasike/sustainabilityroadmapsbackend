@@ -1,12 +1,11 @@
 const express = require('express');
 const router = express.Router();
-const path = require('path');
-const fs = require('fs');
 const { query } = require('../config/db');
 const { authMiddleware } = require('../middleware/auth');
 const upload = require('../middleware/upload');
+const { serveFile } = require('../utils/fileServe');
 
-// GET /api/roadmaps - public
+// GET /api/roadmaps
 router.get('/', async (req, res) => {
   try {
     const { page = 1, limit = 12, search, region, country, year, status } = req.query;
@@ -15,10 +14,7 @@ router.get('/', async (req, res) => {
     const params = [];
     let idx = 1;
 
-    if (search) {
-      conditions.push(`(title ILIKE $${idx} OR country ILIKE $${idx} OR description ILIKE $${idx})`);
-      params.push(`%${search}%`); idx++;
-    }
+    if (search) { conditions.push(`(title ILIKE $${idx} OR country ILIKE $${idx} OR description ILIKE $${idx})`); params.push(`%${search}%`); idx++; }
     if (region) { conditions.push(`region = $${idx}`); params.push(region); idx++; }
     if (country) { conditions.push(`country_code = $${idx}`); params.push(country); idx++; }
     if (year) { conditions.push(`year = $${idx}`); params.push(parseInt(year)); idx++; }
@@ -29,11 +25,7 @@ router.get('/', async (req, res) => {
     const result = await query(`SELECT * FROM roadmaps ${where} ORDER BY created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`, [...params, parseInt(limit), offset]);
     const regionsResult = await query('SELECT DISTINCT region FROM roadmaps WHERE is_published = true AND region IS NOT NULL ORDER BY region');
 
-    res.json({
-      roadmaps: result.rows,
-      regions: regionsResult.rows.map(r => r.region),
-      pagination: { total, page: parseInt(page), limit: parseInt(limit), pages: Math.ceil(total / limit) },
-    });
+    res.json({ roadmaps: result.rows, regions: regionsResult.rows.map(r => r.region), pagination: { total, page: parseInt(page), limit: parseInt(limit), pages: Math.ceil(total / limit) } });
   } catch (error) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -55,42 +47,40 @@ router.get('/:id/download', async (req, res) => {
   try {
     const result = await query('SELECT * FROM roadmaps WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
-
     const roadmap = result.rows[0];
-    await query('UPDATE roadmaps SET download_count = download_count + 1 WHERE id = $1', [req.params.id]);
-    await query('INSERT INTO download_logs (document_type, document_id, ip_address, user_agent) VALUES ($1, $2, $3, $4)',
-      ['roadmap', req.params.id, req.ip, req.get('user-agent')]);
 
-    if (roadmap.file_url) {
-      const filePath = path.join(process.env.UPLOAD_DIR || './uploads', roadmap.file_url.replace('/uploads/', ''));
-      if (fs.existsSync(filePath)) {
-        res.setHeader('Content-Disposition', `attachment; filename="${roadmap.file_name}"`);
-        return res.sendFile(path.resolve(filePath));
-      }
-    }
+    query('UPDATE roadmaps SET download_count = download_count + 1 WHERE id = $1', [roadmap.id]).catch(() => {});
+    query('INSERT INTO download_logs (document_type, document_id, ip_address, user_agent) VALUES ($1,$2,$3,$4)',
+      ['roadmap', roadmap.id, req.ip, req.get('user-agent')]).catch(() => {});
 
-    res.json({ message: 'Download tracked' });
+    serveFile(res, roadmap.file_url, roadmap.file_name, 'attachment');
   } catch (error) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// ADMIN POST
+// GET /api/roadmaps/:id/view — inline PDF viewer
+router.get('/:id/view', async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM roadmaps WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    serveFile(res, result.rows[0].file_url, result.rows[0].file_name, 'inline');
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/roadmaps
 router.post('/', authMiddleware, upload.fields([{ name: 'file', maxCount: 1 }]), async (req, res) => {
   try {
     const { title, country, country_code, region, description, year, status, implementation_period, partners } = req.body;
-
     let fileUrl = null, fileName = null, fileSize = 0;
-    if (req.files?.file) {
-      const file = req.files.file[0];
-      fileUrl = `/uploads/roadmaps/${file.filename}`;
-      fileName = file.originalname;
-      fileSize = file.size;
-    }
+
+    if (req.files?.file) { const f = req.files.file[0]; fileUrl = `/uploads/roadmaps/${f.filename}`; fileName = f.originalname; fileSize = f.size; }
 
     const result = await query(`
       INSERT INTO roadmaps (title, country, country_code, region, description, file_url, file_name, file_size, year, status, implementation_period, partners)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *
     `, [title, country, country_code, region, description, fileUrl, fileName, fileSize, year ? parseInt(year) : null, status || 'active', implementation_period, partners ? partners.split(',').map(p => p.trim()) : []]);
 
     res.status(201).json(result.rows[0]);
@@ -99,7 +89,7 @@ router.post('/', authMiddleware, upload.fields([{ name: 'file', maxCount: 1 }]),
   }
 });
 
-// ADMIN PUT
+// PUT /api/roadmaps/:id
 router.put('/:id', authMiddleware, upload.fields([{ name: 'file', maxCount: 1 }]), async (req, res) => {
   try {
     const existing = await query('SELECT * FROM roadmaps WHERE id = $1', [req.params.id]);
@@ -108,19 +98,12 @@ router.put('/:id', authMiddleware, upload.fields([{ name: 'file', maxCount: 1 }]
     const { title, country, country_code, region, description, year, status, implementation_period, partners, is_published, is_featured } = req.body;
     let { file_url, file_name, file_size } = existing.rows[0];
 
-    if (req.files?.file) {
-      const file = req.files.file[0];
-      file_url = `/uploads/roadmaps/${file.filename}`;
-      file_name = file.originalname;
-      file_size = file.size;
-    }
+    if (req.files?.file) { const f = req.files.file[0]; file_url = `/uploads/roadmaps/${f.filename}`; file_name = f.originalname; file_size = f.size; }
 
     const result = await query(`
-      UPDATE roadmaps SET
-        title=$1, country=$2, country_code=$3, region=$4, description=$5,
-        file_url=$6, file_name=$7, file_size=$8, year=$9, status=$10,
-        implementation_period=$11, partners=$12, is_published=$13, is_featured=$14, updated_at=NOW()
-      WHERE id=$15 RETURNING *
+      UPDATE roadmaps SET title=$1,country=$2,country_code=$3,region=$4,description=$5,
+      file_url=$6,file_name=$7,file_size=$8,year=$9,status=$10,implementation_period=$11,
+      partners=$12,is_published=$13,is_featured=$14,updated_at=NOW() WHERE id=$15 RETURNING *
     `, [title, country, country_code, region, description, file_url, file_name, file_size, year ? parseInt(year) : null, status, implementation_period, partners ? partners.split(',').map(p => p.trim()) : [], is_published !== 'false', is_featured === 'true', req.params.id]);
 
     res.json(result.rows[0]);
@@ -129,7 +112,7 @@ router.put('/:id', authMiddleware, upload.fields([{ name: 'file', maxCount: 1 }]
   }
 });
 
-// ADMIN DELETE
+// DELETE /api/roadmaps/:id
 router.delete('/:id', authMiddleware, async (req, res) => {
   try {
     const result = await query('DELETE FROM roadmaps WHERE id = $1 RETURNING *', [req.params.id]);
